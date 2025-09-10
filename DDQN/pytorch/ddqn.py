@@ -17,16 +17,23 @@ episodes_axis = []
 RUN_LABEL = ""
 
 def make_run_label(args) -> str:
-    if args.target_update_type == "soft":
-        tgt = f"soft, τ={args.tau:g}"
+    if args.replay_buffer == "none":
+        buf = "none"
+    elif args.replay_buffer == "uniform":
+        buf = "uniform"
     else:
-        tgt = f"hard, f={args.hard_update_freq}"
-    buf = args.replay_buffer
-    if buf == "prioritized":
         buf = f"per(α={args.per_alpha:g},β:{args.per_beta0:g}→{args.per_beta1:g})"
-    return f"buffer={buf} | target_network_update={tgt}"
 
-def plot_rewards(episode: int, reward: float, avg_reward: float):
+    if args.target_network:
+        if args.target_update_type == "soft":
+            tgt = f"soft, τ={args.tau:g}"
+        else:
+            tgt = f"hard, f={args.hard_update_freq}"
+    else:
+        tgt = "off"
+    return f"buffer={buf} | target_network_update={tgt} | {args.nstep} step TD-return"
+
+def plot_rewards(episode: int, reward: float, avg_reward : float):
     rewards_history.append(reward)
     avg_rewards_history.append(avg_reward)
     episodes_axis.append(episode)
@@ -48,9 +55,9 @@ def plot_rewards(episode: int, reward: float, avg_reward: float):
 class DDQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.layer1 = nn.Linear(input_dim, 64)
-        self.layer2 = nn.Linear(64, 64)
-        self.layer3 = nn.Linear(64, output_dim)
+        self.layer1 = nn.Linear(input_dim, 128)
+        self.layer2 = nn.Linear(128, 128)
+        self.layer3 = nn.Linear(128, output_dim)
     
     def forward(self, x):
         x = F.relu(self.layer1(x))
@@ -84,6 +91,7 @@ class ReplayBuffer:
 
         self.reward = np.empty((self.max_size, 1), dtype=dtype)
         self.done   = np.empty((self.max_size, 1), dtype=np.float32)
+        self.gpow   = np.empty((self.max_size, 1), dtype=dtype)
 
         self.alpha = float(alpha)
         self.eps = float(eps)
@@ -91,7 +99,7 @@ class ReplayBuffer:
         self.max_priority = 1.0
         self._rng = np.random.default_rng(rng_seed) if rng_seed is not None else np.random.default_rng()
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, done, gpow):
         self.state[self.ptr]      = state
         self.next_state[self.ptr] = next_state
         if self.discrete:
@@ -100,6 +108,7 @@ class ReplayBuffer:
             self.action[self.ptr]    = action
         self.reward[self.ptr, 0] = float(reward)
         self.done[self.ptr, 0]   = float(done)
+        self.gpow[self.ptr, 0]   = float(gpow)
 
         if self.mode == "prioritized":
             self.priorities[self.ptr] = self.max_priority
@@ -127,6 +136,7 @@ class ReplayBuffer:
         ns = torch.as_tensor(self.next_state[ind], device=self.device)
         r  = torch.as_tensor(self.reward[ind], device=self.device)
         d  = torch.as_tensor(self.done[ind], device=self.device)
+        g  = torch.as_tensor(self.gpow[ind], device=self.device)
 
         if self.discrete:
             a = torch.as_tensor(self.action[ind], device=self.device, dtype=torch.long)
@@ -134,7 +144,7 @@ class ReplayBuffer:
             a = torch.as_tensor(self.action[ind], device=self.device)
         
         w  = torch.as_tensor(weights, device=self.device, dtype=torch.float32)
-        return ind, w, s, a, r, ns, d
+        return ind, w, s, a, r, ns, d, g
 
     def update_priorities(self, ind, td_errors):
         if self.mode != "prioritized":
@@ -146,9 +156,58 @@ class ReplayBuffer:
 
     def __len__(self):
         return self.size
+    
+class NStepCollector:
+    def __init__(self, n: int, gamma: float, bootstrap_on_trunc: bool = True):
+        self.n = max(1, int(n))
+        self.gamma = float(gamma)
+        self.bootstrap_on_trunc = bool(bootstrap_on_trunc)
+        self.buf = deque()  # items: (s, a, r, ns, term_eff)
 
+    def _build_transition(self):
+        # assumes len(self.buf) >= 1
+        R = 0.0
+        g = 1.0
+        done_n = False
+        ns_last = None
+        steps = 0
+        for i, (_, _, r_i, ns_i, term_eff) in enumerate(self.buf):
+            R += g * float(r_i)
+            g *= self.gamma
+            steps = i + 1
+            if term_eff or steps == self.n:
+                ns_last = ns_i
+                done_n = bool(term_eff)
+                break
+        # when flushing with < n remaining and no terminal encountered
+        if ns_last is None:
+            ns_last = self.buf[-1][3]
+            steps = len(self.buf)
+            done_n = False
+        gpow = self.gamma ** steps  # γ^k for bootstrapping factor
+        s0, a0 = self.buf[0][0], self.buf[0][1]
+        return (s0, a0, R, ns_last, float(done_n), gpow)
 
-class DDQNAgent:
+    def step(self, s, a, r, ns, terminated: bool, truncated: bool):
+        # effective terminal depending on bootstrap choice
+        term_eff = bool(terminated or (truncated and not self.bootstrap_on_trunc))
+        self.buf.append((s, a, r, ns, term_eff))
+        out = []
+        if len(self.buf) >= self.n or term_eff:
+            out.append(self._build_transition())
+            self.buf.popleft()
+            if term_eff:
+                self.buf.clear()
+        return out
+
+    def flush(self):
+        out = []
+        while len(self.buf) > 0:
+            out.append(self._build_transition())
+            self.buf.popleft()
+        return out
+
+class DQNAgent:
     def __init__(self, state_dim, action_dim, args):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -161,32 +220,34 @@ class DDQNAgent:
         self.learning_starts = args.learning_starts
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.use_replay_buffer = args.replay_buffer
+        self.replay_mode = args.replay_buffer
+        self.use_target_network = bool(args.target_network)
         
-        if self.use_replay_buffer == "none":
-            self.memory = None
-            self.last_transition = None
-        else:
+        if self.replay_mode != "none":
             self.memory = ReplayBuffer(
                 state_shape=(state_dim,), action_dim=1, max_size=args.memory_size,
-                discrete_action=True, device=self.device, mode=self.use_replay_buffer,
+                discrete_action=True, device=self.device, mode=self.replay_mode,
                 alpha=args.per_alpha, eps=args.per_eps, rng_seed=args.seed
             )
             self.beta0, self.beta1 = args.per_beta0, args.per_beta1
             self.beta_steps = args.per_beta_steps
-
+        else:
+            self.memory = None
+            self.last_transition = None
         self.model = DDQN(state_dim, action_dim).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr)
         
-        self.target_model = DDQN(state_dim, action_dim).to(self.device)
-        self.target_model.load_state_dict(self.model.state_dict())
-        self.target_model.eval()
-        self.target_update_type = args.target_update_type
-        self.tau = args.tau
-        if self.target_update_type == "soft":
-            assert 0.0 < self.tau <= 1.0
-        elif self.target_update_type == "hard":
-            self.tau = None
+        if self.use_target_network:
+            self.target_model = DDQN(state_dim, action_dim).to(self.device)
+            self.target_model.load_state_dict(self.model.state_dict())
+            self.target_model.eval()
+            self.target_update_type = args.target_update_type
+            self.tau = args.tau
+            if self.target_update_type == "soft":
+                assert 0.0 < self.tau <= 1.0
+        else:
+            self.target_model = self.model
+            self.target_update_type = "none"
 
         self.samples_drawn = 0
         self.steps_done = 0
@@ -194,18 +255,20 @@ class DDQNAgent:
     @torch.no_grad()
     def hard_update(self):
         """Target <- Online (hard copy)"""
+        if not self.use_target_network: return
         self.target_model.load_state_dict(self.model.state_dict())
 
     @torch.no_grad()
     def soft_update(self):
         """Target <- (1-tau)*Target + tau*Online (Polyak/EMA)"""
+        if not self.use_target_network: return
         tau = self.tau
         for tp, p in zip(self.target_model.parameters(), self.model.parameters()):
             tp.data.mul_(1.0 - tau).add_(tau * p.data)
 
-    def select_action(self, state: np.ndarray) -> int:
-        frac = min(1.0, self.steps_done / max(1, self.epsilon_decay))
-        eps = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * (1.0 - frac)
+    def select_action(self, state):
+        eps = self.epsilon_end + (self.epsilon_start - self.epsilon_end) \
+                * math.exp(-1. * self.steps_done / max(1.0, self.epsilon_decay))
 
         # decide action with epsilon-greedy policy
         if random.random() < eps:
@@ -224,57 +287,58 @@ class DDQNAgent:
             finally:
                 if was_training:
                     self.model.train()
-
+        
         self.steps_done += 1
         return action
     
     def current_beta(self):
-        if self.use_replay_buffer != "prioritized":
+        if self.replay_mode != "prioritized":
             return 1.0
+        if self.beta_steps <= 0:
+            return self.beta1
         t = min(self.samples_drawn, self.beta_steps)
         return self.beta0 + (self.beta1 - self.beta0) * (t / self.beta_steps)
 
     def optimize_model(self):
-           
-        if self.use_replay_buffer == "none":
+        if self.replay_mode != "none":
+            if len(self.memory) < max(self.batch_size, self.learning_starts):
+                return
+            beta = self.current_beta() if self.replay_mode == "prioritized" else 1.0
+            batch_idx, weights, states, actions, rewards, next_states, dones, gpows = self.memory.sample(self.batch_size, beta=beta)
+            self.samples_drawn += len(batch_idx) if batch_idx is not None else 1
+        else:
             if self.last_transition is None:
                 return
-            s, a, r, ns, d = self.last_transition
+            s, a, r, ns, d, g = self.last_transition
             states = torch.as_tensor(s, device=self.device, dtype=torch.float32).unsqueeze(0)
             actions = torch.as_tensor([[int(a)]], device=self.device, dtype=torch.long)
             rewards = torch.as_tensor([[float(r)]], device=self.device, dtype=torch.float32)
             next_states = torch.as_tensor(ns, device=self.device, dtype=torch.float32).unsqueeze(0)
             dones = torch.as_tensor([[float(d)]], device=self.device, dtype=torch.float32)
+            gpows       = torch.as_tensor([[float(g)]], device=self.device, dtype=torch.float32)
             weights   = torch.ones((1, 1), dtype=torch.float32, device=self.device)
             batch_idx = None
-        else:
-            if len(self.memory) < max(self.batch_size, self.learning_starts):
-                return
-            beta = self.current_beta() if self.use_replay_buffer == "prioritized" else 1.0
-            batch_idx, weights, states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, beta=beta)
-            self.samples_drawn += len(batch_idx) if batch_idx is not None else 1
-
 
         current_q_values = self.model(states).gather(1, actions)
         with torch.no_grad():
-            next_actions   = self.model(next_states).argmax(dim=1, keepdim=True)
-            q_next_target  = self.target_model(next_states).gather(1, next_actions)
-        target = rewards + self.gamma * q_next_target * (1.0 - dones)
-        td_error = target - current_q_values
-        per_sample_loss = F.smooth_l1_loss(current_q_values, target, reduction="none")
+            next_actions = self.model(next_states).argmax(dim=1, keepdim=True)
+            next_q_values = self.target_model(next_states).gather(1, next_actions)
+        expected_q_values = rewards + gpows * next_q_values * (1.0 - dones)
+        td_error = expected_q_values - current_q_values
+        per_sample_loss = F.smooth_l1_loss(current_q_values, expected_q_values, reduction='none')
         loss = (weights * per_sample_loss).mean()
-        
-        self.optimizer.zero_grad(set_to_none=True)
+
+        self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        if self.use_replay_buffer == "prioritized":
+        if self.replay_mode == "prioritized":
             self.memory.update_priorities(
                 batch_idx,
                 td_error.detach().squeeze(1).cpu().numpy()
             )
 
-        if self.target_update_type == "soft":
+        if self.use_target_network and self.target_update_type == "soft":
             self.soft_update()
     
 
@@ -283,15 +347,15 @@ def main():
     parser.add_argument("--episodes", type=int, default=1000, help="Number of training episodes, default: 1000")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training, default: 64")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor, default: 0.99")
-    parser.add_argument("--epsilon_start", type=float, default=1.0, help="Starting value of epsilon, default: 1.0")
-    parser.add_argument("--epsilon_end", type=float, default=0.02, help="Final value of epsilon, default: 0.02")
-    parser.add_argument("--epsilon_decay", type=int, default=10000, help="Decay rate of epsilon, default: 10000")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate, default: 1e-3")
+    parser.add_argument("--epsilon_start", type=float, default=0.9, help="Starting value of epsilon, default: 0.9")
+    parser.add_argument("--epsilon_end", type=float, default=0.05, help="Final value of epsilon, default: 0.05")
+    parser.add_argument("--epsilon_decay", type=int, default=5000, help="Decay rate of epsilon, default: 5000")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate, default: 1e-4")
     parser.add_argument("--learning_starts", type=int, default=100, help="Number of steps before starting training, default: 100")    
-    parser.add_argument("--memory_size", type=int, default=50000, help="Replay memory size, default: 50000")
+    parser.add_argument("--memory_size", type=int, default=10000, help="Replay memory size, default: 10000")
     parser.add_argument("--target_update_type", choices=["hard", "soft"], default="soft",help="How to update target network: 'hard' or 'soft' (Polyak/EMA), default: soft")
-    parser.add_argument("--tau", type=float, default=0.01, help="Soft update factor for target (0<tau<=1). Used when --target_update_type=soft, default: 0.01")
-    parser.add_argument("--hard_update_freq", type=int, default=1000, help="Target network update frequency (in steps), Used when --target_update_type=hard, default: 1000")
+    parser.add_argument("--tau", type=float, default=0.005, help="Soft update factor for target (0<tau<=1). Used when --target_update_type=soft, default: 0.005")
+    parser.add_argument("--hard_update_freq", type=int, default=200, help="Target network update frequency (in steps), Used when --target_update_type=hard, default: 200")
     parser.add_argument("--seed", type=int, default=42, help="Random seed, default: 42")
     parser.add_argument("--replay_buffer", choices=["none", "uniform", "prioritized"], default="prioritized",
                             help="Experience buffer type: none | uniform | prioritized, default: prioritized")
@@ -300,6 +364,14 @@ def main():
     parser.add_argument("--per-beta1", type=float, default=1.0, help="final β")
     parser.add_argument("--per-beta-steps", type=int, default=50000, help="steps to anneal β")
     parser.add_argument("--per-eps", type=float, default=1e-5, help="priority epsilon")
+    parser.add_argument(
+        "--target-network",action=argparse.BooleanOptionalAction, default=True,
+        help="Enable or disable target network (default: enabled)",
+    )
+    parser.add_argument("--nstep", type=int, default=1,
+        help="n-step TD horizon; nstep 1 == standard DDQN if the target network is used")
+    parser.add_argument("--bootstrap-on-trunc", action=argparse.BooleanOptionalAction, default=True,
+        help="If true, do NOT treat truncations as terminal for TD targets")
     args = parser.parse_args()
 
     global RUN_LABEL
@@ -319,8 +391,11 @@ def main():
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    agent = DDQNAgent(obs_dim, action_dim, args)
-
+    agent = DQNAgent(obs_dim, action_dim, args)
+    collector = NStepCollector(n=args.nstep, gamma=args.gamma,
+                               bootstrap_on_trunc=args.bootstrap_on_trunc)
+    
+    total_steps = 0
     recent_rewards = deque(maxlen=100)
 
     for ep in range(1, args.episodes + 1):
@@ -328,33 +403,41 @@ def main():
         state = np.asarray(state, dtype=np.float32)
         ep_reward = 0.0
         done = False
+        collector.flush()
 
         while not done:
             action = agent.select_action(state)
             obs_next, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             ep_reward += float(reward)
-
             next_state = np.asarray(obs_next, dtype=np.float32)
+            transitions = collector.step(state, action, float(reward), next_state, terminated, truncated)
 
-            if agent.use_replay_buffer != "none":
-                agent.memory.push(state, action, float(reward), next_state, float(terminated))
-            else:
-                agent.last_transition = (state, action, float(reward), next_state, float(terminated))
-            agent.optimize_model()
+            for (s0, a0, Rn, nsn, done_n, gpow) in transitions:
+                if agent.replay_mode != "none":
+                    agent.memory.push(s0, a0, Rn, nsn, float(done_n), float(gpow))
+                else:
+                    agent.last_transition = (s0, a0, Rn, nsn, float(done_n), float(gpow))
+                agent.optimize_model()
 
+            total_steps += 1
 
-
-            if agent.target_update_type == "hard" and agent.steps_done % args.hard_update_freq == 0:
+            if agent.use_target_network and agent.target_update_type == "hard" and total_steps % args.hard_update_freq == 0:
                 agent.hard_update()
 
             state = next_state
 
+        for (s0, a0, Rn, nsn, done_n, gpow) in collector.flush():
+            if agent.replay_mode != "none":
+                agent.memory.push(s0, a0, Rn, nsn, float(done_n), float(gpow))
+            else:
+                agent.last_transition = (s0, a0, Rn, nsn, float(done_n), float(gpow))
+            agent.optimize_model()
+
         recent_rewards.append(ep_reward)
-        
+        avg100 = np.mean(recent_rewards) if len(recent_rewards) > 0 else ep_reward
+        print(f"Episode {ep:4d} | Reward {ep_reward:.1f} | Avg100 {avg100:.2f} | Steps {agent.steps_done}")
         if ep % 10 == 0:
-            avg100 = np.mean(recent_rewards) if len(recent_rewards) > 0 else ep_reward
-            print(f"Episode {ep:4d} | Reward {ep_reward:.1f} | Avg100 {avg100:.2f} | Steps {agent.steps_done}")
             plot_rewards(ep, ep_reward, avg100)
         else:
             plt.pause(0.001)
