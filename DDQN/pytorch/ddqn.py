@@ -165,7 +165,6 @@ class NStepCollector:
         self.buf = deque()  # items: (s, a, r, ns, term_eff)
 
     def _build_transition(self):
-        # assumes len(self.buf) >= 1
         R = 0.0
         g = 1.0
         done_n = False
@@ -179,7 +178,6 @@ class NStepCollector:
                 ns_last = ns_i
                 done_n = bool(term_eff)
                 break
-        # when flushing with < n remaining and no terminal encountered
         if ns_last is None:
             ns_last = self.buf[-1][3]
             steps = len(self.buf)
@@ -189,7 +187,6 @@ class NStepCollector:
         return (s0, a0, R, ns_last, float(done_n), gpow)
 
     def step(self, s, a, r, ns, terminated: bool, truncated: bool):
-        # effective terminal depending on bootstrap choice
         term_eff = bool(terminated or (truncated and not self.bootstrap_on_trunc))
         self.buf.append((s, a, r, ns, term_eff))
         out = []
@@ -345,7 +342,7 @@ class DQNAgent:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=1000, help="Number of training episodes, default: 1000")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training, default: 64")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training, default: 128")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor, default: 0.99")
     parser.add_argument("--epsilon_start", type=float, default=0.9, help="Starting value of epsilon, default: 0.9")
     parser.add_argument("--epsilon_end", type=float, default=0.05, help="Final value of epsilon, default: 0.05")
@@ -383,7 +380,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    env = gym.make("CartPole-v1")
+    env = gym.make("LunarLander-v3")
     env.action_space.seed(args.seed)
     env.observation_space.seed(args.seed)
 

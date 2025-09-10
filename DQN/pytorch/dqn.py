@@ -55,9 +55,9 @@ def plot_rewards(episode: int, reward: float, avg_reward : float):
 class DQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.layer1 = nn.Linear(input_dim, 64)
-        self.layer2 = nn.Linear(64, 64)
-        self.layer3 = nn.Linear(64, output_dim)
+        self.layer1 = nn.Linear(input_dim, 128)
+        self.layer2 = nn.Linear(128, 128)
+        self.layer3 = nn.Linear(128, output_dim)
     
     def forward(self, x):
         x = F.relu(self.layer1(x))
@@ -341,7 +341,7 @@ class DQNAgent:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=1000, help="Number of training episodes, default: 1000")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training, default: 64")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training, default: 128")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor, default: 0.99")
     parser.add_argument("--epsilon_start", type=float, default=0.9, help="Starting value of epsilon, default: 0.9")
     parser.add_argument("--epsilon_end", type=float, default=0.05, help="Final value of epsilon, default: 0.05")
@@ -379,7 +379,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    env = gym.make("CartPole-v1")
+    env = gym.make("LunarLander-v3")
     env.action_space.seed(args.seed)
     env.observation_space.seed(args.seed)
 
